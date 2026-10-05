@@ -44,8 +44,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+          username: ocp-splat+splat_team_push
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Build image for amd64 and arm64
         uses: docker/build-push-action@v6
