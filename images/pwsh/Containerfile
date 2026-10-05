@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1
+ARG POWERSHELL_VERSION=7.3.12
+
+# Fetch the official target-architecture archive on the build host.
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS fetch
+ARG TARGETARCH
+ARG POWERSHELL_VERSION
+RUN apk add --no-cache ca-certificates curl \
+ && case "${TARGETARCH}" in \
+      amd64) powershell_arch=x64; powershell_sha256=34d2ed497f11d3c160a6a20abd635686458d7c5173fede7ad354bd73327fe89b ;; \
+      arm64) powershell_arch=arm64; powershell_sha256=c0b465bb60b4d8814682e7f4078006c3a118ec10cf98deb2143849ac18aa2e39 ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && archive="powershell-${POWERSHELL_VERSION}-linux-${powershell_arch}.tar.gz" \
+ && curl --fail --show-error --location --retry 3 \
+      "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/${archive}" \
+      --output "/tmp/${archive}" \
+ && echo "${powershell_sha256}  /tmp/${archive}" | sha256sum -cs \
+ && mkdir -p /out \
+ && cp "/tmp/${archive}" /out/powershell.tar.gz
+
+# Reuse the exact managed PowerCLI/EPS modules from the original image. Pin by
+# digest because this bootstrap image is amd64-only and its tag will be replaced.
+FROM --platform=linux/amd64 quay.io/ocp-splat/pwsh@sha256:36f84103a2a3f51c65e7613e5f2a0059cfa5728386096e258783f93d82c691c2 AS module-source
+
+# Azure CLI includes native Python packages on some architectures; compile them
+# in this target-platform stage and leave the toolchain out of the runtime image.
+FROM registry.access.redhat.com/ubi9/ubi:9.4 AS azure-cli-build
+ARG AZURE_CLI_VERSION=2.61.0.post20240516044921
+WORKDIR /go/src/github.com/openshift/installer
+COPY images/pwsh/azure-cli-requirements.lock ./azure-cli-requirements.lock
+RUN yum install -y gcc python3 python3-devel python3-pip \
+ && python3 -m venv azure-cli \
+ && azure-cli/bin/pip install --no-cache-dir --pre \
+      --requirement azure-cli-requirements.lock \
+      --extra-index-url https://azurecliprod.blob.core.windows.net/edge \
+ && azure-cli/bin/az version --output none \
+ && azure-cli/bin/az mysql flexible-server list --help --only-show-errors > /dev/null \
+ && yum clean all \
+ && rm -rf /var/cache/yum
+
+# UBI 9 provides native amd64 and arm64 variants; BuildKit selects by target platform.
+FROM registry.access.redhat.com/ubi9/ubi:9.4
+ARG POWERCLI_VERSION=13.2.1.22851661
+ARG EPS_VERSION=1.0
+ARG AZURE_CLI_VERSION=2.61.0.post20240516044921
+COPY --from=fetch /out/powershell.tar.gz /tmp/powershell.tar.gz
+COPY --from=module-source /usr/local/share/powershell/Modules /usr/local/share/powershell/Modules
+COPY --from=module-source /root/.local/share/powershell/Modules /root/.local/share/powershell/Modules
+COPY --from=azure-cli-build /go/src/github.com/openshift/installer/azure-cli /go/src/github.com/openshift/installer/azure-cli
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true \
+    POWERSHELL_TELEMETRY_OPTOUT=1
+WORKDIR /go/src/github.com/openshift/installer
+RUN yum install -y \
+      krb5-libs \
+      libicu \
+      libuuid \
+      openssl-libs \
+      python3 \
+      zlib \
+ && mkdir -p /opt/microsoft/powershell/7 \
+ && tar -xzf /tmp/powershell.tar.gz -C /opt/microsoft/powershell/7 \
+ && rm -f /tmp/powershell.tar.gz \
+ && chmod 0755 /opt/microsoft/powershell/7/pwsh \
+ && ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh \
+ && yum clean all \
+ && rm -rf /var/cache/yum
+
+# Match the installer image's expected Azure CLI location and pin its release.
+RUN ln -s /go/src/github.com/openshift/installer/azure-cli/bin/az /usr/local/bin/az \
+ && azure-cli/bin/az version --output none \
+ && azure_version="$(azure-cli/bin/az version --query '"azure-cli"' --output tsv)" \
+ && test "${azure_version}" = "${AZURE_CLI_VERSION}" \
+ && pwsh -NoLogo -NoProfile -Command \
+      '$ErrorActionPreference = "Stop"; Import-Module VMware.PowerCLI; Import-Module EPS; $powerCli = Get-Module VMware.PowerCLI -ListAvailable | Select-Object -First 1 -ExpandProperty Version; $eps = Get-Module EPS -ListAvailable | Select-Object -First 1 -ExpandProperty Version; if ($powerCli.ToString() -ne "${env:POWERCLI_VERSION}") { throw "Unexpected PowerCLI version: $powerCli" }; if ($eps.ToString() -ne "${env:EPS_VERSION}.0") { throw "Unexpected EPS version: $eps" }; $PSVersionTable.PSVersion.ToString()'
+
+CMD ["/bin/bash"]
