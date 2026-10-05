@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+ARG GOVC_VERSION=v0.30.7
+
+# Fetch the architecture-specific upstream release without emulating the builder.
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS fetch
+ARG TARGETARCH
+ARG GOVC_VERSION
+RUN apk add --no-cache ca-certificates curl tar \
+ && case "${TARGETARCH}" in \
+      amd64) govc_arch=x86_64; govc_sha256=bd204fdc941ceb04681144189492c8959adb39f5f8de76a56fa4835809bfd2ad ;; \
+      arm64) govc_arch=arm64; govc_sha256=a88481fc5dd9b302f3674bed754c14459f0515b13becb72f1de9930c58ff5468 ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && archive="govc_Linux_${govc_arch}.tar.gz" \
+ && curl --fail --show-error --location --retry 3 \
+      "https://github.com/vmware/govmomi/releases/download/${GOVC_VERSION}/${archive}" \
+      --output "/tmp/${archive}" \
+ && echo "${govc_sha256}  /tmp/${archive}" | sha256sum -cs \
+ && mkdir -p /out/certs /out/tmp \
+ && tar -xzf "/tmp/${archive}" -C /out govc \
+ && cp /etc/ssl/certs/ca-certificates.crt /out/certs/ca-certificates.crt \
+ && chmod 0755 /out/govc \
+ && chmod 1777 /out/tmp
+
+# Keep the final image minimal, like the existing govc image.
+FROM scratch
+COPY --from=fetch /out/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=fetch --chown=10001:10001 --chmod=1777 /out/tmp /tmp
+COPY --from=fetch --chown=10001:10001 /out/govc /govc
+USER 10001:10001
+ENV GOVMOMI_HOME=/tmp
+CMD ["/govc"]
